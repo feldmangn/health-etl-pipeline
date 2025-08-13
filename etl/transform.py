@@ -1,93 +1,99 @@
 import sqlite3
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "data" / "health.db"
-VIZ_DIR = ROOT / "viz"
-VIZ_DIR.mkdir(exist_ok=True)
 
-con = sqlite3.connect(DB_PATH)
+with sqlite3.connect(DB_PATH) as con:
+    # ---- Extract raw tables
+    patients = pd.read_sql_query("SELECT * FROM patients", con, dtype=str)
+    enc = pd.read_sql_query("SELECT * FROM encounters", con, dtype=str)
+    conds = pd.read_sql_query("SELECT * FROM conditions", con, dtype=str)
 
-#Extract Data from database
-patients = pd.read_sql_query("SELECT * FROM patients", con, dtype=str)
-enc = pd.read_sql_query("SELECT * FROM encounters", con, dtype=str)
-conds = pd.read_sql_query("SELECT * FROM conditions", con, dtype=str)
+# ---- Clean & coerce types
+# Patients
+patients["birth_year"] = pd.to_numeric(patients.get("birth_year"), errors="coerce")
+patients["sex"] = patients.get("sex", "").str.strip()
+patients["state"] = patients.get("state", "").str.strip()
+patients = patients.drop_duplicates(subset=["patient_id"]).dropna(subset=["patient_id"])
 
-#Parse Dates
-enc["start_date"] = pd.to_datetime(enc["start_date"])
-conds["onset_date"] = pd.to_datetime(conds["onset_date"], errors="coerce")
+# Encounters
+enc["start_date"] = pd.to_datetime(enc["start_date"], errors="coerce")
+enc["encounter_type"] = enc.get("encounter_type", "").str.strip().str.lower()
+enc["facility"] = enc.get("facility", "").str.strip()
+enc = enc.dropna(subset=["encounter_id", "patient_id", "start_date"]).drop_duplicates(subset=["encounter_id"])
 
-# 30 day readmit flag for inpatient encoutners
+# Conditions
+conds["onset_date"] = pd.to_datetime(conds.get("onset_date"), errors="coerce")
+conds["condition_code"] = conds.get("condition_code", "").str.strip()
+conds["condition_name"] = conds.get("condition_name", "").str.strip()
+conds = conds.dropna(subset=["patient_id", "condition_code"]).drop_duplicates()
+
+# ---- Referential integrity: keep only rows with known patients
+valid_pids = set(patients["patient_id"])
+enc = enc[enc["patient_id"].isin(valid_pids)]
+conds = conds[conds["patient_id"].isin(valid_pids)]
+
+# ---- Business rule: 30-day readmission flag (inpatient only)
 enc = enc.sort_values(["patient_id", "start_date"]).reset_index(drop=True)
 enc["was_readmit"] = False
 
 for pid, grp in enc.groupby("patient_id"):
-    grp = grp.reset_index()
-    for i, row in grp.iterrows():
+    g = grp.reset_index()  # keep original index
+    for _, row in g.iterrows():
         if row["encounter_type"] != "inpatient":
             continue
-        later = grp[
-            (grp["index"] != row["index"]) &
-            (grp["encounter_type"] == "inpatient") &
-            (grp["start_date"] > row["start_date"]) &
-            (grp["start_date"] <= row["start_date"] + pd.Timedelta(days=30))
+        win = g[
+            (g["index"] != row["index"]) &
+            (g["encounter_type"] == "inpatient") &
+            (g["start_date"] > row["start_date"]) &
+            (g["start_date"] <= row["start_date"] + pd.Timedelta(days=30))
         ]
-        if len(later) > 0:
+        if len(win) > 0:
             enc.loc[row["index"], "was_readmit"] = True
 
-# New flag 
-with con:
-    con.execute("DROP TABLE IF EXISTS encounters;")
-    enc_to_write = enc.copy()
-    # Convert bools to strings for SQLite consistency
-    enc_to_write["was_readmit"] = enc_to_write["was_readmit"].astype(str)
-    enc_to_write.to_sql("encounters", con, if_exists="replace", index=False)
+# ---- Write cleaned tables back to SQLite (no visuals)
+with sqlite3.connect(DB_PATH) as con:
+    # Replace “*_clean” tables atomically
+    patients.to_sql("patients_clean", con, if_exists="replace", index=False)
+    enc_out = enc.copy()
+    enc_out["was_readmit"] = enc_out["was_readmit"].astype(bool)  # store as 0/1 boolean in SQLite
+    enc_out.to_sql("encounters_clean", con, if_exists="replace", index=False)
+    conds.to_sql("conditions_clean", con, if_exists="replace", index=False)
 
+    # Helpful indexes
+    con.execute("CREATE INDEX IF NOT EXISTS ix_patients_clean_pid ON patients_clean(patient_id);")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_enc_clean_pid_date ON encounters_clean(patient_id, start_date);")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_conds_clean_pid ON conditions_clean(patient_id);")
 
-# ---- Analytics: readmit rate by month
-q_readmit = """
-WITH fe AS (
-  SELECT date(strftime('%Y-%m-01', start_date)) AS month_start,
-         was_readmit
-  FROM encounters
-)
-SELECT month_start,
-       AVG(CASE WHEN was_readmit='True' THEN 1.0 ELSE 0.0 END) AS readmit_rate
-FROM fe
-GROUP BY month_start
-ORDER BY month_start;
-"""
-df_readmit = pd.read_sql_query(q_readmit, con)
+    # Dim/Fact style convenience views for BI (optional)
+    con.execute("DROP VIEW IF EXISTS vw_readmit_month;")
+    con.execute("""
+        CREATE VIEW vw_readmit_month AS
+        WITH fe AS (
+          SELECT date(strftime('%Y-%m-01', start_date)) AS month_start,
+                 CASE WHEN was_readmit THEN 1.0 ELSE 0.0 END AS readmit
+          FROM encounters_clean
+        )
+        SELECT month_start, AVG(readmit) AS readmit_rate
+        FROM fe
+        GROUP BY month_start
+        ORDER BY month_start;
+    """)
 
-# ---- Analytics: top conditions by unique patients
-q_top = """
-SELECT condition_name, COUNT(DISTINCT patient_id) AS patients
-FROM conditions
-GROUP BY condition_name
-ORDER BY patients DESC
-LIMIT 10;
-"""
-df_top = pd.read_sql_query(q_top, con)
+    con.execute("DROP VIEW IF EXISTS vw_top_conditions;")
+    con.execute("""
+        CREATE VIEW vw_top_conditions AS
+        SELECT condition_name, COUNT(DISTINCT patient_id) AS patients
+        FROM conditions_clean
+        GROUP BY condition_name
+        ORDER BY patients DESC;
+    """)
 
-con.close()
-
-# ---- Visualize
-plt.figure()
-plt.plot(df_readmit["month_start"], df_readmit["readmit_rate"], marker="o")
-plt.title("Monthly 30-day Readmission Rate")
-plt.xlabel("Month")
-plt.ylabel("Rate")
-plt.tight_layout()
-plt.savefig(VIZ_DIR / "readmit_rate.png")
-print("Saved viz/readmit_rate.png")
-
-plt.figure()
-plt.barh(df_top["condition_name"], df_top["patients"])
-plt.title("Top Conditions by Patient Count")
-plt.xlabel("Patients")
-plt.gca().invert_yaxis()
-plt.tight_layout()
-plt.savefig(VIZ_DIR / "top_conditions.png")
-print("Saved viz/top_conditions.png")
+# ---- Lightweight QA printouts (no plots)
+print("=== CLEAN SUMMARY ===")
+print(f"patients_clean:   {len(patients):,}")
+print(f"encounters_clean: {len(enc):,}  (with was_readmit computed)")
+print(f"conditions_clean: {len(conds):,}")
+print("Views created: vw_readmit_month, vw_top_conditions")
